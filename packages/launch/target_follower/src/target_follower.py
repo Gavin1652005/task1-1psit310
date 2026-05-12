@@ -2,67 +2,107 @@
 
 import rospy
 from duckietown_msgs.msg import Twist2DStamped
-from duckietown_msgs.msg import FSMState
 from duckietown_msgs.msg import AprilTagDetectionArray
 
-class Target_Follower:
+
+class TargetFollower:
+
     def __init__(self):
-        
-        #Initialize ROS node
+
         rospy.init_node('target_follower_node', anonymous=True)
-
-        # When shutdown signal is received, we run clean_shutdown function
         rospy.on_shutdown(self.clean_shutdown)
-        
-        ###### Init Pub/Subs. REMEMBER TO REPLACE "akandb" WITH YOUR ROBOT'S NAME #####
-        self.cmd_vel_pub = rospy.Publisher('/akandb/car_cmd_switch_node/cmd', Twist2DStamped, queue_size=1)
-        rospy.Subscriber('/akandb/apriltag_detector_node/detections', AprilTagDetectionArray, self.tag_callback, queue_size=1)
-        ################################################################
 
-        rospy.spin() # Spin forever but listen to message callbacks
+        robot_name = "mybota002445b"
 
-    # Apriltag Detection Callback
-    def tag_callback(self, msg):
-        self.move_robot(msg.detections)
- 
-    # Stop Robot before node has shut down. This ensures the robot keep moving with the latest velocity command
-    def clean_shutdown(self):
-        rospy.loginfo("System shutting down. Stopping robot...")
-        self.stop_robot()
+        self.cmd_pub = rospy.Publisher(
+            f'/{robot_name}/car_cmd_switch_node/cmd',
+            Twist2DStamped,
+            queue_size=1
+        )
 
-    # Sends zero velocity to stop the robot
-    def stop_robot(self):
-        cmd_msg = Twist2DStamped()
-        cmd_msg.header.stamp = rospy.Time.now()
-        cmd_msg.v = 0.0
-        cmd_msg.omega = 0.0
-        self.cmd_vel_pub.publish(cmd_msg)
+        rospy.Subscriber(
+            f'/{robot_name}/apriltag_detector_node/detections',
+            AprilTagDetectionArray,
+            self.detection_cb,
+            queue_size=1
+        )
 
-    def move_robot(self, detections):
+        # latest detection storage
+        self.has_detection = False
+        self.x = 0.0
+        self.z = 0.0
 
-        #### YOUR CODE GOES HERE ####
+        # control params
+        self.goal_distance = 0.10
 
-        if len(detections) == 0:
+        self.kp_ang = 2.0
+        self.kp_lin = 0.6
+
+        # control loop at 10 Hz
+        rospy.Timer(rospy.Duration(0.1), self.control_loop)
+
+        rospy.loginfo("Target follower running (stable loop)")
+        rospy.spin()
+
+    # ---------------- STORE DETECTION ----------------
+    def detection_cb(self, msg):
+
+        if len(msg.detections) == 0:
+            self.has_detection = False
             return
 
-        x = detections[0].transform.translation.x
-        y = detections[0].transform.translation.y
-        z = detections[0].transform.translation.z
+        tag = min(msg.detections, key=lambda d: d.transform.translation.z)
 
-        rospy.loginfo("x,y,z: %f %f %f", x, y, z)
+        self.x = tag.transform.translation.x
+        self.z = tag.transform.translation.z
 
+        self.has_detection = True
 
-        # Publish a velocity
-        cmd_msg = Twist2DStamped()
-        cmd_msg.header.stamp = rospy.Time.now()
-        cmd_msg.v = 0.0
-        cmd_msg.omega = 0.0
-        self.cmd_vel_pub.publish(cmd_msg)
+    # ---------------- MAIN CONTROL LOOP ----------------
+    def control_loop(self, event):
 
-        #############################
+        cmd = Twist2DStamped()
+
+        # -------- SEARCH MODE --------
+        if not self.has_detection:
+            cmd.v = 0.0
+            cmd.omega = 0.8   # smooth continuous spin
+            self.cmd_pub.publish(cmd)
+            return
+
+        # -------- STOP MODE --------
+        if self.z <= self.goal_distance:
+            cmd.v = 0.0
+            cmd.omega = 0.0
+            self.cmd_pub.publish(cmd)
+            return
+
+        # -------- TRACK MODE --------
+        omega = -self.kp_ang * self.x
+        v = self.kp_lin * (self.z - self.goal_distance)
+
+        # smoothing
+        v *= max(0.2, 1.0 - abs(self.x) * 2.0)
+
+        # clamp
+        omega = max(-2.0, min(2.0, omega))
+        v = max(0.0, min(0.25, v))
+
+        cmd.v = v
+        cmd.omega = omega
+
+        self.cmd_pub.publish(cmd)
+
+    # ---------------- SHUTDOWN ----------------
+    def clean_shutdown(self):
+        cmd = Twist2DStamped()
+        cmd.v = 0.0
+        cmd.omega = 0.0
+        self.cmd_pub.publish(cmd)
+
 
 if __name__ == '__main__':
     try:
-        target_follower = Target_Follower()
+        TargetFollower()
     except rospy.ROSInterruptException:
         pass
